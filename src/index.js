@@ -1,22 +1,22 @@
 /**
- * ============================================================
- * NEXUS STRIPE OAUTH — Cloudflare Worker (v2.1)
- * ============================================================
+ * NEXUS STRIPE OAUTH — Cloudflare Worker v3.0
+ * Soporta AMBOS modos TEST y LIVE dinámicamente.
  *
- * VARIABLES DE ENTORNO REQUERIDAS EN CLOUDFLARE:
- *   STRIPE_TEST_CLIENT_ID     → ca_...
- *   STRIPE_TEST_SECRET_KEY    → sk_test_...
- *   STRIPE_LIVE_CLIENT_ID     → ca_... (opcional)
- *   STRIPE_LIVE_SECRET_KEY    → sk_live_... (opcional)
- *   APP_SCHEME                → nexusbillings
- *
- * REDIRECT URI EN STRIPE DASHBOARD:
- *   https://nexus-stripe-oauth.nexuslabsappinvoice.workers.dev/oauth/callback
- * ============================================================
+ * Variables requeridas en Cloudflare:
+ *   STRIPE_TEST_CLIENT_ID, STRIPE_TEST_SECRET_KEY
+ *   STRIPE_LIVE_CLIENT_ID, STRIPE_LIVE_SECRET_KEY
+ *   APP_SCHEME = nexusbillings
  */
 
-const VERSION = "2.1.0";
+const VERSION = "3.0.0";
 const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout"];
+
+function keysFor(env, mode) {
+  const isLive = mode === "live";
+  const clientId = isLive ? env.STRIPE_LIVE_CLIENT_ID : env.STRIPE_TEST_CLIENT_ID;
+  const secretKey = isLive ? env.STRIPE_LIVE_SECRET_KEY : env.STRIPE_TEST_SECRET_KEY;
+  return { clientId, secretKey, mode: isLive ? "live" : "test" };
+}
 
 export default {
   async fetch(request, env) {
@@ -35,8 +35,7 @@ export default {
       if (path === "/connect-url" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const device_id = body.device_id || "unknown";
-        const mode = body.mode === "live" ? "live" : "test";
-        const clientId = mode === "live" ? env.STRIPE_LIVE_CLIENT_ID : env.STRIPE_TEST_CLIENT_ID;
+        const { clientId, mode } = keysFor(env, body.mode);
         if (!clientId) return withCors(json({ error: "client_id_not_configured", mode }, 500));
 
         const state = btoa(JSON.stringify({ device_id, mode, ts: Date.now() }));
@@ -48,7 +47,7 @@ export default {
           redirect_uri: redirectUri,
           state,
         }).toString();
-        return withCors(json({ url: authUrl, redirect_uri: redirectUri }));
+        return withCors(json({ url: authUrl, redirect_uri: redirectUri, mode }));
       }
 
       if (path === "/oauth/callback" && request.method === "GET") {
@@ -63,8 +62,7 @@ export default {
         let stateData = { device_id: "unknown", mode: "test" };
         try { if (stateRaw) stateData = JSON.parse(atob(stateRaw)); } catch { /* ignore */ }
 
-        const mode = stateData.mode === "live" ? "live" : "test";
-        const secretKey = mode === "live" ? env.STRIPE_LIVE_SECRET_KEY : env.STRIPE_TEST_SECRET_KEY;
+        const { secretKey, mode } = keysFor(env, stateData.mode);
         if (!secretKey) return htmlError("Secret key no configurada en el Worker", mode);
 
         const tokenRes = await fetch("https://connect.stripe.com/oauth/token", {
@@ -89,7 +87,7 @@ export default {
           `&device_id=${encodeURIComponent(stateData.device_id)}` +
           `&mode=${encodeURIComponent(mode)}`;
 
-        return successHtml(deepLink);
+        return successHtml(deepLink, mode);
       }
 
       if (path === "/account/status" && request.method === "POST") {
@@ -98,8 +96,8 @@ export default {
         if (!account_id || !account_id.startsWith("acct_")) {
           return withCors(json({ error: "invalid_account_id" }, 400));
         }
-        const secretKey = env.STRIPE_TEST_SECRET_KEY;
-        if (!secretKey) return withCors(json({ error: "secret_key_not_configured" }, 500));
+        const { secretKey, mode } = keysFor(env, body.mode);
+        if (!secretKey) return withCors(json({ error: "secret_key_not_configured", mode }, 500));
 
         const res = await fetch(`https://api.stripe.com/v1/accounts/${account_id}`, {
           headers: { "Authorization": `Bearer ${secretKey}` },
@@ -110,6 +108,7 @@ export default {
             error: data.error.code || "stripe_error",
             detail: data.error.message,
             code: data.error.code,
+            mode,
           }, res.status));
         }
         return withCors(json({
@@ -129,8 +128,7 @@ export default {
         const account_id = body.account_id;
         if (!account_id) return withCors(json({ error: "invalid_account_id" }, 400));
 
-        const clientId = env.STRIPE_TEST_CLIENT_ID;
-        const secretKey = env.STRIPE_TEST_SECRET_KEY;
+        const { clientId, secretKey, mode } = keysFor(env, body.mode);
         const res = await fetch("https://connect.stripe.com/oauth/deauthorize", {
           method: "POST",
           headers: {
@@ -146,6 +144,7 @@ export default {
         return withCors(json({
           ok: !data.error,
           stripe_user_id: account_id,
+          mode,
           detail: data.error?.message,
         }, data.error ? res.status : 200));
       }
@@ -165,8 +164,8 @@ export default {
         if (!amount || amount <= 0) {
           return withCors(json({ error: "invalid_amount" }, 400));
         }
-        const secretKey = env.STRIPE_TEST_SECRET_KEY;
-        if (!secretKey) return withCors(json({ error: "secret_key_not_configured" }, 500));
+        const { secretKey, mode } = keysFor(env, body.mode);
+        if (!secretKey) return withCors(json({ error: "secret_key_not_configured", mode }, 500));
 
         const amountCents = Math.round(amount * 100);
         const params = new URLSearchParams({
@@ -198,12 +197,14 @@ export default {
             error: "checkout_failed",
             code: data.error.code || "stripe_error",
             detail: data.error.message,
+            mode,
           }, res.status));
         }
         return withCors(json({
           url: data.url,
           session_id: data.id,
           expires_at: data.expires_at,
+          mode,
         }));
       }
 
@@ -229,8 +230,11 @@ function withCors(response) {
   return new Response(response.body, { status: response.status, headers: h });
 }
 
-function successHtml(deepLink) {
+function successHtml(deepLink, mode) {
   const safeLink = deepLink.replace(/"/g, "&quot;");
+  const modeBadge = mode === "live"
+    ? '<span style="background:#DC2626;color:#fff;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:800;letter-spacing:0.06em">LIVE</span>'
+    : '<span style="background:#6366F1;color:#fff;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:800;letter-spacing:0.06em">TEST</span>';
   const html = `<!doctype html>
 <html lang="es"><head>
 <meta charset="utf-8">
@@ -239,36 +243,30 @@ function successHtml(deepLink) {
 <style>
   *{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-       background:linear-gradient(135deg,#EEF2FF 0%,#F5F3FF 100%);
+       background:linear-gradient(135deg,#FFF7ED 0%,#FFEDD5 100%);
        display:flex;align-items:center;justify-content:center;min-height:100vh;
        margin:0;padding:20px}
   .card{background:#fff;border-radius:24px;padding:36px 28px;max-width:420px;
         width:100%;text-align:center;
-        box-shadow:0 20px 60px rgba(99,91,255,0.15)}
+        box-shadow:0 20px 60px rgba(234,88,12,0.18)}
   .icon{width:88px;height:88px;border-radius:44px;background:#D1FAE5;
         display:flex;align-items:center;justify-content:center;margin:0 auto 16px;
         font-size:48px}
   h1{color:#111827;margin:0 0 8px;font-size:26px;font-weight:800}
-  p{color:#4B5563;line-height:1.55;margin:0 0 28px;font-size:15px}
-  .btn{display:inline-block;background:#635BFF;color:#fff !important;
+  p{color:#4B5563;line-height:1.55;margin:0 0 24px;font-size:15px}
+  .btn{display:inline-block;background:#EA580C;color:#fff !important;
        padding:18px 32px;border-radius:14px;text-decoration:none;
-       font-weight:800;font-size:17px;box-shadow:0 8px 24px rgba(99,91,255,0.35)}
+       font-weight:800;font-size:17px;box-shadow:0 8px 24px rgba(234,88,12,0.35)}
   .btn:active{transform:scale(0.97)}
   .hint{margin-top:20px;font-size:12px;color:#9CA3AF}
-  .fallback{margin-top:12px;font-size:11px;color:#6B7280;word-break:break-all;
-            background:#F3F4F6;padding:8px;border-radius:8px;font-family:monospace}
 </style></head>
 <body>
 <div class="card">
   <div class="icon">✅</div>
-  <h1>¡Cuenta conectada!</h1>
+  <h1>¡Cuenta conectada! ${modeBadge}</h1>
   <p>Toca el botón para regresar a Nexus Billings y finalizar la vinculación.</p>
   <a class="btn" href="${safeLink}" id="openBtn">Volver a Nexus Billings →</a>
   <p class="hint">Si la app no abre, verifica que esté instalada.</p>
-  <details style="margin-top:16px;text-align:left">
-    <summary style="font-size:11px;color:#9CA3AF;cursor:pointer">Detalles técnicos</summary>
-    <div class="fallback">${safeLink}</div>
-  </details>
 </div>
 <script>
   setTimeout(function(){
@@ -320,3 +318,4 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
