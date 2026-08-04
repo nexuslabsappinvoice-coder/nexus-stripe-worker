@@ -1,24 +1,21 @@
 /**
  * ============================================================
- * NEXUS STRIPE OAUTH — Cloudflare Worker (COMPLETO)
+ * NEXUS STRIPE OAUTH — Cloudflare Worker (v2.1)
  * ============================================================
  *
- * ESTE ARCHIVO REEMPLAZA COMPLETAMENTE `src/index.js` de tu repo
- * `nexus-stripe-worker`.
- *
  * VARIABLES DE ENTORNO REQUERIDAS EN CLOUDFLARE:
- *   STRIPE_TEST_CLIENT_ID     → ca_...    (Stripe Connect settings, TEST)
- *   STRIPE_TEST_SECRET_KEY    → sk_test_... (Developers → API keys, TEST)
- *   STRIPE_LIVE_CLIENT_ID     → ca_...    (opcional, para live)
- *   STRIPE_LIVE_SECRET_KEY    → sk_live_... (opcional, para live)
+ *   STRIPE_TEST_CLIENT_ID     → ca_...
+ *   STRIPE_TEST_SECRET_KEY    → sk_test_...
+ *   STRIPE_LIVE_CLIENT_ID     → ca_... (opcional)
+ *   STRIPE_LIVE_SECRET_KEY    → sk_live_... (opcional)
  *   APP_SCHEME                → nexusbillings
  *
- * REDIRECT URI EN STRIPE DASHBOARD (dashboard.stripe.com/test/settings/connect):
- *   Agrega: https://nexus-stripe-oauth.nexuslabsappinvoice.workers.dev/oauth/callback
+ * REDIRECT URI EN STRIPE DASHBOARD:
+ *   https://nexus-stripe-oauth.nexuslabsappinvoice.workers.dev/oauth/callback
  * ============================================================
  */
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout"];
 
 export default {
@@ -178,8 +175,8 @@ export default {
           "line_items[0][price_data][product_data][name]": description.slice(0, 250),
           "line_items[0][price_data][unit_amount]": String(amountCents),
           "line_items[0][quantity]": "1",
-          "success_url": "https://nexuslabsappinvoice-coder.github.io/payment-success.html",
-          "cancel_url": "https://nexuslabsappinvoice-coder.github.io/payment-cancelled.html",
+          "success_url": "https://nexuslabsappinvoice-coder.github.io/Legal/payment-success.html?session_id={CHECKOUT_SESSION_ID}",
+          "cancel_url": "https://nexuslabsappinvoice-coder.github.io/Legal/payment-cancelled.html?session_id={CHECKOUT_SESSION_ID}",
         });
         if (customer_email) params.set("customer_email", customer_email);
         for (const [k, v] of Object.entries(metadata)) {
@@ -323,4 +320,3 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
-
