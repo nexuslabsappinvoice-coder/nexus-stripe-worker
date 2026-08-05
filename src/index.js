@@ -1,16 +1,32 @@
 /**
- * NEXUS STRIPE OAUTH — Cloudflare Worker v3.1.0
- * Soporta AMBOS modos TEST y LIVE + auto-verificación de pagos.
+ * ============================================================
+ * NEXUS STRIPE OAUTH — Cloudflare Worker v3.2.0
+ * ============================================================
+ * Soporta AMBOS modos TEST y LIVE dinámicamente según el parámetro
+ * `mode` que envía la app en cada request.
  *
- * Variables requeridas en Cloudflare:
- *   STRIPE_TEST_CLIENT_ID, STRIPE_TEST_SECRET_KEY
- *   STRIPE_LIVE_CLIENT_ID, STRIPE_LIVE_SECRET_KEY
- *   APP_SCHEME = nexusbillings
+ * ─── VARIABLES DE ENTORNO REQUERIDAS EN CLOUDFLARE ──────────
+ *   STRIPE_TEST_CLIENT_ID     → ca_...      (Stripe Connect, TEST)
+ *   STRIPE_TEST_SECRET_KEY    → sk_test_... (API keys, TEST)
+ *   STRIPE_LIVE_CLIENT_ID     → ca_...      (Stripe Connect, LIVE)
+ *   STRIPE_LIVE_SECRET_KEY    → sk_live_... (API keys, LIVE)
+ *   APP_SCHEME                → nexusbillings
+ *
+ * ─── KV NAMESPACE REQUERIDO (para /trial/check) ─────────────
+ *   Variable name: TRIAL_KV
+ *   Crea un KV namespace nuevo llamado "nexus-trial-kv" y
+ *   bindealo en Settings → Variables → KV Namespace Bindings.
+ *
+ * ─── REDIRECT URIs EN STRIPE ────────────────────────────────
+ * Agrega AMBOS (en test y live settings):
+ *   https://nexus-stripe-oauth.nexuslabsappinvoice.workers.dev/oauth/callback
+ * ============================================================
  */
 
-const VERSION = "3.1.0";
-const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout", "/checkout/status"];
+const VERSION = "3.2.0";
+const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout", "/checkout/status", "/trial/check"];
 
+// Elige el par (clientId, secretKey) correcto según el modo pedido.
 function keysFor(env, mode) {
   const isLive = mode === "live";
   const clientId = isLive ? env.STRIPE_LIVE_CLIENT_ID : env.STRIPE_TEST_CLIENT_ID;
@@ -32,7 +48,7 @@ export default {
         return withCors(json({ service: "nexus-stripe-oauth", version: VERSION, endpoints: ENDPOINTS }));
       }
 
-      // ───── POST /connect-url ─────
+      // ───────── POST /connect-url ─────────
       if (path === "/connect-url" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const device_id = body.device_id || "unknown";
@@ -51,7 +67,7 @@ export default {
         return withCors(json({ url: authUrl, redirect_uri: redirectUri, mode }));
       }
 
-      // ───── GET /oauth/callback ─────
+      // ───────── GET /oauth/callback ─────────
       if (path === "/oauth/callback" && request.method === "GET") {
         const code = url.searchParams.get("code");
         const stateRaw = url.searchParams.get("state");
@@ -92,7 +108,7 @@ export default {
         return successHtml(deepLink, mode);
       }
 
-      // ───── POST /account/status ─────
+      // ───────── POST /account/status ─────────
       if (path === "/account/status" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const account_id = body.account_id;
@@ -126,7 +142,7 @@ export default {
         }));
       }
 
-      // ───── POST /account/deauthorize ─────
+      // ───────── POST /account/deauthorize ─────────
       if (path === "/account/deauthorize" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const account_id = body.account_id;
@@ -153,7 +169,7 @@ export default {
         }, data.error ? res.status : 200));
       }
 
-      // ───── POST /checkout ─────
+      // ───────── POST /checkout ─────────
       if (path === "/checkout" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const account_id = body.account_id;
@@ -173,6 +189,15 @@ export default {
         if (!secretKey) return withCors(json({ error: "secret_key_not_configured", mode }, 500));
 
         const amountCents = Math.round(amount * 100);
+        // iter-110 · Platform commission — Nexus Labs se lleva 0.5% de
+        // cada transacción de sus users conectados.  Stripe descuenta
+        // esto ANTES de transferir al connected account.  Ajustable
+        // vía body.application_fee_percent (0-10) para pruebas.
+        const feePercentRaw = Number(body.application_fee_percent);
+        const feePercent = Number.isFinite(feePercentRaw) && feePercentRaw >= 0 && feePercentRaw <= 10
+          ? feePercentRaw
+          : 0.5;   // default 0.5%
+        const applicationFeeCents = Math.round(amountCents * feePercent / 100);
         const params = new URLSearchParams({
           "mode": "payment",
           "line_items[0][price_data][currency]": currency,
@@ -182,6 +207,9 @@ export default {
           "success_url": "https://nexuslabsappinvoice-coder.github.io/Legal/payment-success.html?session_id={CHECKOUT_SESSION_ID}",
           "cancel_url": "https://nexuslabsappinvoice-coder.github.io/Legal/payment-cancelled.html?session_id={CHECKOUT_SESSION_ID}",
         });
+        if (applicationFeeCents > 0) {
+          params.set("payment_intent_data[application_fee_amount]", String(applicationFeeCents));
+        }
         if (customer_email) params.set("customer_email", customer_email);
         for (const [k, v] of Object.entries(metadata)) {
           params.append(`metadata[${k}]`, String(v));
@@ -213,9 +241,11 @@ export default {
         }));
       }
 
-      // ───── POST /checkout/status ─────
-      // Auto-verify pagos: consulta el estado de una Checkout Session
-      // con el header Stripe-Account. Usado por el poller de la app.
+      // ───────── POST /checkout/status ─────────
+      // iter-108 · Auto-verify pagos.  Consulta el estado de una
+      // Checkout Session usando el header Stripe-Account de la cuenta
+      // conectada.  Devuelve { paid: bool, amount_total, currency,
+      // payment_intent, session_id }.
       if (path === "/checkout/status" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const session_id = body.session_id;
@@ -253,6 +283,57 @@ export default {
           payment_intent: data.payment_intent,
           customer_email: data.customer_details?.email || null,
           mode,
+        }));
+      }
+
+      // ───────── POST /trial/check ─────────
+      // iter-111 · Anti-reset del trial premium.  El usuario envía un
+      // device_id derivado de Application.getAndroidId() (Android) o
+      // Application.getIosIdForVendorAsync() (iOS).  El Worker guarda
+      // en KV la fecha del PRIMER contacto de ese device.  Aunque el
+      // usuario desinstale/reinstale la app, el device_id se mantiene
+      // en el hardware, así que devolvemos la fecha ORIGINAL del
+      // trial y la app la usa en vez de crear una nueva.
+      //
+      // Config Cloudflare requerida:
+      //   Settings → Variables → KV Namespace Bindings:
+      //   Variable name: TRIAL_KV
+      //   KV namespace : (crea uno nuevo llamado "nexus-trial-kv")
+      if (path === "/trial/check" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const device_id = String(body.device_id || "").trim();
+        const app_id = String(body.app_id || "nexus-billings").trim();
+        if (!device_id || device_id.length < 4) {
+          return withCors(json({ error: "invalid_device_id" }, 400));
+        }
+        if (!env.TRIAL_KV) {
+          // Si el KV no está configurado, devolvemos degradado gracefully:
+          // la app usará la fecha local sin protección remota.
+          return withCors(json({
+            error: "kv_not_configured",
+            hint: "Añade un KV namespace 'TRIAL_KV' en Cloudflare Settings → Variables → KV Namespace Bindings",
+            first_seen_at: null,
+            is_new: true,
+          }, 200));
+        }
+        const key = `trial:${app_id}:${device_id}`;
+        const existing = await env.TRIAL_KV.get(key);
+        const now = new Date().toISOString();
+        if (existing) {
+          const daysSince = Math.floor((Date.now() - new Date(existing).getTime()) / 86400000);
+          return withCors(json({
+            first_seen_at: existing,
+            days_since_first: daysSince,
+            is_new: false,
+          }));
+        }
+        // Primer contacto — registramos.  TTL de 5 años (más que
+        // suficiente para un trial de 7 días y para grandfathering).
+        await env.TRIAL_KV.put(key, now, { expirationTtl: 60 * 60 * 24 * 365 * 5 });
+        return withCors(json({
+          first_seen_at: now,
+          days_since_first: 0,
+          is_new: true,
         }));
       }
 
