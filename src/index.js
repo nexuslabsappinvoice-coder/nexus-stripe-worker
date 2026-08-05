@@ -1,6 +1,6 @@
 /**
- * NEXUS STRIPE OAUTH — Cloudflare Worker v3.0
- * Soporta AMBOS modos TEST y LIVE dinámicamente.
+ * NEXUS STRIPE OAUTH — Cloudflare Worker v3.1.0
+ * Soporta AMBOS modos TEST y LIVE + auto-verificación de pagos.
  *
  * Variables requeridas en Cloudflare:
  *   STRIPE_TEST_CLIENT_ID, STRIPE_TEST_SECRET_KEY
@@ -8,8 +8,8 @@
  *   APP_SCHEME = nexusbillings
  */
 
-const VERSION = "3.0.0";
-const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout"];
+const VERSION = "3.1.0";
+const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout", "/checkout/status"];
 
 function keysFor(env, mode) {
   const isLive = mode === "live";
@@ -32,6 +32,7 @@ export default {
         return withCors(json({ service: "nexus-stripe-oauth", version: VERSION, endpoints: ENDPOINTS }));
       }
 
+      // ───── POST /connect-url ─────
       if (path === "/connect-url" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const device_id = body.device_id || "unknown";
@@ -50,6 +51,7 @@ export default {
         return withCors(json({ url: authUrl, redirect_uri: redirectUri, mode }));
       }
 
+      // ───── GET /oauth/callback ─────
       if (path === "/oauth/callback" && request.method === "GET") {
         const code = url.searchParams.get("code");
         const stateRaw = url.searchParams.get("state");
@@ -90,6 +92,7 @@ export default {
         return successHtml(deepLink, mode);
       }
 
+      // ───── POST /account/status ─────
       if (path === "/account/status" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const account_id = body.account_id;
@@ -123,6 +126,7 @@ export default {
         }));
       }
 
+      // ───── POST /account/deauthorize ─────
       if (path === "/account/deauthorize" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const account_id = body.account_id;
@@ -149,6 +153,7 @@ export default {
         }, data.error ? res.status : 200));
       }
 
+      // ───── POST /checkout ─────
       if (path === "/checkout" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const account_id = body.account_id;
@@ -204,6 +209,49 @@ export default {
           url: data.url,
           session_id: data.id,
           expires_at: data.expires_at,
+          mode,
+        }));
+      }
+
+      // ───── POST /checkout/status ─────
+      // Auto-verify pagos: consulta el estado de una Checkout Session
+      // con el header Stripe-Account. Usado por el poller de la app.
+      if (path === "/checkout/status" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const session_id = body.session_id;
+        const account_id = body.account_id;
+        if (!session_id || !session_id.startsWith("cs_")) {
+          return withCors(json({ error: "invalid_session_id" }, 400));
+        }
+        if (!account_id || !account_id.startsWith("acct_")) {
+          return withCors(json({ error: "invalid_account_id" }, 400));
+        }
+        const { secretKey, mode } = keysFor(env, body.mode);
+        if (!secretKey) return withCors(json({ error: "secret_key_not_configured", mode }, 500));
+
+        const res = await fetch(`https://api.stripe.com/v1/checkout/sessions/${session_id}`, {
+          headers: {
+            "Authorization": `Bearer ${secretKey}`,
+            "Stripe-Account": account_id,
+          },
+        });
+        const data = await res.json();
+        if (data.error) {
+          return withCors(json({
+            error: "status_lookup_failed",
+            code: data.error.code || "stripe_error",
+            detail: data.error.message,
+            mode,
+          }, res.status));
+        }
+        return withCors(json({
+          session_id: data.id,
+          paid: data.payment_status === "paid",
+          payment_status: data.payment_status,
+          amount_total: data.amount_total,
+          currency: data.currency,
+          payment_intent: data.payment_intent,
+          customer_email: data.customer_details?.email || null,
           mode,
         }));
       }
