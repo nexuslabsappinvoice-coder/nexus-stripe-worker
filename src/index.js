@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * NEXUS STRIPE OAUTH — Cloudflare Worker v3.2.0
+ * NEXUS STRIPE OAUTH — Cloudflare Worker v3.3.0
  * ============================================================
  * Soporta AMBOS modos TEST y LIVE dinámicamente según el parámetro
  * `mode` que envía la app en cada request.
@@ -20,11 +20,27 @@
  * ─── REDIRECT URIs EN STRIPE ────────────────────────────────
  * Agrega AMBOS (en test y live settings):
  *   https://nexus-stripe-oauth.nexuslabsappinvoice.workers.dev/oauth/callback
+ *
+ * ─── STRIPE TERMINAL (Tap to Pay) — v3.3.0 ──────────────────
+ * Activa Terminal en https://dashboard.stripe.com/settings/terminal
+ * Los endpoints /terminal/* usan las MISMAS keys que ya tienes
+ * (STRIPE_TEST_SECRET_KEY / STRIPE_LIVE_SECRET_KEY) según el
+ * campo `mode` que envía la app.  No necesitas secrets nuevos.
  * ============================================================
  */
 
-const VERSION = "3.2.0";
-const ENDPOINTS = ["/connect-url", "/oauth/callback", "/account/status", "/account/deauthorize", "/checkout", "/checkout/status", "/trial/check"];
+const VERSION = "3.3.0";
+const ENDPOINTS = [
+  "/connect-url",
+  "/oauth/callback",
+  "/account/status",
+  "/account/deauthorize",
+  "/checkout",
+  "/checkout/status",
+  "/trial/check",
+  "/terminal/connection-token",
+  "/terminal/payment-intent",
+];
 
 // Elige el par (clientId, secretKey) correcto según el modo pedido.
 function keysFor(env, mode) {
@@ -337,6 +353,25 @@ export default {
         }));
       }
 
+      // ───────── POST /terminal/connection-token ─────────
+      // iter-120 · Stripe Tap to Pay.  Mint un ConnectionToken que el
+      // SDK @stripe/stripe-terminal-react-native usa para autenticar
+      // el lector NFC del teléfono comerciante.  Crea (o reutiliza)
+      // una Terminal Location en la cuenta conectada y guarda el ID
+      // en metadata[terminal_location_id] para no crearla cada vez.
+      if (path === "/terminal/connection-token" && request.method === "POST") {
+        return withCors(await handleConnectionToken(request, env));
+      }
+
+      // ───────── POST /terminal/payment-intent ─────────
+      // iter-120 · Stripe Tap to Pay.  Crea un PaymentIntent con
+      // payment_method_types=card_present para que el SDK lo confirme
+      // localmente después de que el cliente tape su tarjeta al NFC.
+      // Respeta la comisión de 0.5% de la plataforma (application_fee).
+      if (path === "/terminal/payment-intent" && request.method === "POST") {
+        return withCors(await handlePaymentIntent(request, env));
+      }
+
       return withCors(json({ error: "not_found", path }, 404));
     } catch (e) {
       return withCors(json({ error: "worker_exception", detail: String(e?.message || e) }, 500));
@@ -357,6 +392,125 @@ function withCors(response) {
   h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   h.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   return new Response(response.body, { status: response.status, headers: h });
+}
+
+// ─── Stripe Terminal (Tap to Pay) helpers ─────────────────────
+// iter-120 · Wrapper para llamadas Stripe firmadas con Stripe-Account
+// header (necesario para Connect + Terminal).
+async function stripeTerminalCall(secretKey, path, method, connectedAccountId, body, idem) {
+  const headers = {
+    Authorization: `Bearer ${secretKey}`,
+    "Stripe-Account": connectedAccountId,
+  };
+  if (body) headers["Content-Type"] = "application/x-www-form-urlencoded";
+  if (idem) headers["Idempotency-Key"] = idem;
+  const r = await fetch(`https://api.stripe.com${path}`, { method, headers, body });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data?.error?.message || "Stripe request failed");
+  return data;
+}
+
+// POST /terminal/connection-token
+// Body: { connectedAccountId: "acct_...", mode?: "live" | "test" }
+async function handleConnectionToken(request, env) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const acct = String(body?.connectedAccountId || "").trim();
+    if (!/^acct_[A-Za-z0-9]+$/.test(acct)) {
+      return json({ error: "invalid_connected_account" }, 400);
+    }
+    const { secretKey, mode } = keysFor(env, body?.mode);
+    if (!secretKey) return json({ error: "secret_key_not_configured", mode }, 500);
+
+    // Reutiliza o crea una Terminal Location por cuenta conectada.
+    // Guardamos el location_id en metadata del Account así no hace
+    // falta persistir en KV/D1.
+    let locationId;
+    try {
+      const account = await stripeTerminalCall(secretKey, `/v1/accounts/${acct}`, "GET", acct);
+      locationId = account?.metadata?.terminal_location_id;
+    } catch { /* ignore */ }
+
+    if (!locationId) {
+      const p = new URLSearchParams({
+        display_name: "Default Location",
+        "address[line1]": "Business Address",
+        "address[city]": "Miami",
+        "address[state]": "FL",
+        "address[postal_code]": "33101",
+        "address[country]": "US",
+      });
+      const loc = await stripeTerminalCall(
+        secretKey, "/v1/terminal/locations", "POST", acct, p, `loc-${acct}`,
+      );
+      locationId = loc.id;
+      const m = new URLSearchParams();
+      m.set("metadata[terminal_location_id]", locationId);
+      await stripeTerminalCall(secretKey, `/v1/accounts/${acct}`, "POST", acct, m);
+    }
+
+    const p = new URLSearchParams();
+    if (locationId) p.set("location", locationId);
+    const tok = await stripeTerminalCall(
+      secretKey, "/v1/terminal/connection_tokens", "POST", acct, p,
+    );
+    return json({ secret: tok.secret, locationId, mode });
+  } catch (e) {
+    return json({ error: e?.message || "connection_token_failed" }, 500);
+  }
+}
+
+// POST /terminal/payment-intent
+// Body: {
+//   connectedAccountId: "acct_...",
+//   amount: 5300,                  // en CENTAVOS
+//   currency: "usd",
+//   orderId?: "qc-...",
+//   applicationFeeAmount?: 100,    // opcional (ya en centavos)
+//   mode?: "live" | "test",
+// }
+async function handlePaymentIntent(request, env) {
+  try {
+    const b = await request.json().catch(() => ({}));
+    const acct = String(b?.connectedAccountId || "").trim();
+    if (!/^acct_[A-Za-z0-9]+$/.test(acct)) {
+      return json({ error: "invalid_connected_account" }, 400);
+    }
+    if (!Number.isInteger(b?.amount) || b.amount < 50 || b.amount > 99999999) {
+      return json({ error: "invalid_amount" }, 400);
+    }
+    const currency = String(b?.currency || "usd").toLowerCase();
+    if (!/^[a-z]{3}$/.test(currency)) {
+      return json({ error: "invalid_currency" }, 400);
+    }
+    const { secretKey, mode } = keysFor(env, b?.mode);
+    if (!secretKey) return json({ error: "secret_key_not_configured", mode }, 500);
+
+    const p = new URLSearchParams({
+      amount: String(b.amount),
+      currency,
+      "payment_method_types[]": "card_present",
+      "capture_method": "automatic",
+    });
+    if (b.orderId) p.set("metadata[order_id]", String(b.orderId));
+    // iter-120 · Mismo 0.5% de comisión que /checkout, pero aquí la
+    // app envía el monto en centavos ya calculado para no duplicar
+    // lógica.  Si viene 0, no se cobra fee.
+    if (
+      Number.isInteger(b.applicationFeeAmount) &&
+      b.applicationFeeAmount > 0 &&
+      b.applicationFeeAmount < b.amount
+    ) {
+      p.set("application_fee_amount", String(b.applicationFeeAmount));
+    }
+    const pi = await stripeTerminalCall(
+      secretKey, "/v1/payment_intents", "POST", acct, p,
+      b.orderId ? `pi-${b.orderId}` : undefined,
+    );
+    return json({ id: pi.id, clientSecret: pi.client_secret, status: pi.status, mode });
+  } catch (e) {
+    return json({ error: e?.message || "payment_intent_failed" }, 500);
+  }
 }
 
 function successHtml(deepLink, mode) {
@@ -447,4 +601,3 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
-
